@@ -1,35 +1,34 @@
-import os
-from flask import Flask, request, jsonify
+from flask import Flask, request
+import os, json, sys, time
 
 app = Flask(__name__)
 
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "meu_token_whatsapp_2025")
+def log(*args):
+    print(*args, flush=True)
 
-@app.route("/")
-def home():
-    return "Webhook WhatsApp ativo", 200
+@app.get("/")
+def health():
+    log("HEALTH HIT", request.method, request.path)
+    return "ok", 200
 
-@app.route("/webhook", methods=["GET"])
-@app.route("/webhook", methods=["GET"])
+@app.get("/webhook")
 def verify():
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
-
-    print("VERIFY GET:", {"mode": mode, "token": token, "challenge": challenge})
-
-    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+    log("VERIFY GET:", {"mode": mode, "token": token, "challenge": challenge})
+    # se quiser travar por token, compare com env VERIFY_TOKEN
+    expected = os.getenv("VERIFY_TOKEN", "777")
+    if mode == "subscribe" and token == expected:
         return challenge, 200
+    return "forbidden", 403
 
-    return "Token inválido", 403
-
-@app.route("/webhook", methods=["POST"])
-@app.route("/webhook", methods=["POST"])
+@app.post("/webhook")
 def webhook():
     data = request.get_json(silent=True)
-    print("=== INCOMING WEBHOOK POST ===")
-    print("Headers:", dict(request.headers))
-    print("Body:", data)
+    log("=== INCOMING WEBHOOK POST ===")
+    log("Headers:", dict(request.headers))
+    log("Body:", json.dumps(data, ensure_ascii=False) if data else data)
     return "ok", 200
 
 if __name__ == "__main__":
