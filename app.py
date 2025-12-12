@@ -10,15 +10,18 @@ def home():
     return "Webhook WhatsApp ativo", 200
 
 @app.route("/webhook", methods=["GET"])
+@app.route("/webhook", methods=["GET"])
 def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+    mode = request.args.get("hub.mode", "")
+    token = request.args.get("hub.verify_token", "")
+    challenge = request.args.get("hub.challenge", "")
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
+    print("VERIFY GET:", {"mode": mode, "token": token, "challenge": challenge})
+
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
         return challenge, 200
 
-    return "Erro de verificação", 403
+    return "Token inválido", 403
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
