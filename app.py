@@ -24,10 +24,13 @@ def verify():
     return "Token inválido", 403
 
 @app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
-    print("Mensagem recebida:", data)
-    return jsonify({"status": "ok"}), 200
+    data = request.get_json(silent=True)
+    print("=== INCOMING WEBHOOK POST ===")
+    print("Headers:", dict(request.headers))
+    print("Body:", data)
+    return "ok", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
