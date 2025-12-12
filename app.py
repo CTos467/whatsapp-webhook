@@ -2,252 +2,225 @@ import os
 import json
 import hmac
 import hashlib
+import logging
 from datetime import datetime, timezone
 
 from flask import Flask, request, abort, Response
 import psycopg2
-from psycopg2.extras import Json
+import psycopg2.extras
 
 
-app = Flask(__name__)
+# --------------------------
+# Config / Logging
+# --------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("whatsapp-webhook")
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 APP_SECRET = os.getenv("APP_SECRET", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-
-# Se quiser permitir POST de teste via curl sem assinatura (SÓ pra debug),
-# defina no Render: ALLOW_UNVERIFIED_TEST=true
-ALLOW_UNVERIFIED_TEST = os.getenv("ALLOW_UNVERIFIED_TEST", "false").lower() == "true"
+DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("DATABASE_URL".lower(), "")
+ALLOW_UNVERIFIED_TEST = os.getenv("ALLOW_UNVERIFIED_TEST", "false").lower() in ("1", "true", "yes", "y")
 
 
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada.")
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+def _normalize_db_url(url: str) -> str:
+    # Render costuma fornecer algo tipo postgres://... (psycopg2 aceita),
+    # e às vezes sem sslmode. Vamos garantir sslmode=require.
+    if not url:
+        return url
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    return url
 
 
-def ensure_tables():
-    with db_conn() as conn:
+DB_DSN = _normalize_db_url(DATABASE_URL)
+
+
+# --------------------------
+# DB Helpers
+# --------------------------
+def db_connect():
+    if not DB_DSN:
+        raise RuntimeError("DATABASE_URL não está definida no Render.")
+    return psycopg2.connect(DB_DSN)
+
+
+def db_init():
+    # cria tabela se não existir
+    with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS wa_messages (
                     id BIGSERIAL PRIMARY KEY,
-                    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    wa_message_id TEXT,
-                    wa_from TEXT,
-                    wa_name TEXT,
-                    wa_type TEXT,
-                    wa_text TEXT,
-                    timestamp_wa TEXT,
-                    phone_number_id TEXT,
-                    display_phone_number TEXT,
-                    raw_payload JSONB NOT NULL
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    source TEXT NOT NULL,
+                    from_wa TEXT NULL,
+                    wa_id TEXT NULL,
+                    msg_id TEXT NULL,
+                    msg_type TEXT NULL,
+                    text_body TEXT NULL,
+                    raw JSONB NOT NULL
                 );
                 """
             )
+        conn.commit()
+    log.info("[DB] Tabela wa_messages OK")
+
+
+def db_insert(source: str, payload: dict, from_wa=None, wa_id=None, msg_id=None, msg_type=None, text_body=None):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_wa_messages_wa_from
-                ON wa_messages (wa_from);
-                """
+                INSERT INTO wa_messages (source, from_wa, wa_id, msg_id, msg_type, text_body, raw)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (source, from_wa, wa_id, msg_id, msg_type, text_body, json.dumps(payload)),
             )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_wa_messages_wa_message_id
-                ON wa_messages (wa_message_id);
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS wa_events (
-                    id BIGSERIAL PRIMARY KEY,
-                    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    event_type TEXT,
-                    raw_payload JSONB NOT NULL
-                );
-                """
-            )
-            conn.commit()
+        conn.commit()
 
 
-_tables_ready = False
-
-
-@app.before_request
-def _init_once():
-    global _tables_ready
-    if not _tables_ready and DATABASE_URL:
-        ensure_tables()
-        _tables_ready = True
-
-
+# --------------------------
+# Signature validation (Meta)
+# --------------------------
 def verify_meta_signature(raw_body: bytes) -> bool:
     """
-    Meta manda cabeçalho:
-      X-Hub-Signature-256: sha256=<hash>
-    O hash é HMAC-SHA256 do raw_body usando o APP_SECRET.
+    Meta envia header: X-Hub-Signature-256: sha256=<hex>
     """
     if not APP_SECRET:
-        # Se não tiver APP_SECRET, não tem como validar assinatura
+        log.warning("[SIG] APP_SECRET vazio. Assinatura não pode ser validada.")
         return False
 
-    sig = request.headers.get("X-Hub-Signature-256", "")
-    if not sig.startswith("sha256="):
+    header = request.headers.get("X-Hub-Signature-256", "")
+    if not header.startswith("sha256="):
+        log.warning("[SIG] Header X-Hub-Signature-256 ausente ou inválido.")
         return False
 
-    their_hash = sig.split("sha256=", 1)[1].strip()
-    mac = hmac.new(APP_SECRET.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256)
-    our_hash = mac.hexdigest()
+    received = header.split("=", 1)[1].strip()
+    expected = hmac.new(APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    ok = hmac.compare_digest(received, expected)
 
-    return hmac.compare_digest(our_hash, their_hash)
-
-
-def store_event(event_type: str, payload: dict):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO wa_events (event_type, raw_payload) VALUES (%s, %s);",
-                (event_type, Json(payload)),
-            )
-            conn.commit()
+    if not ok:
+        log.warning("[SIG] Assinatura inválida.")
+    return ok
 
 
-def store_message(msg: dict, payload: dict, metadata: dict, contact_name: str | None):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO wa_messages
-                (wa_message_id, wa_from, wa_name, wa_type, wa_text, timestamp_wa,
-                 phone_number_id, display_phone_number, raw_payload)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
-                """,
-                (
-                    msg.get("id"),
-                    msg.get("from"),
-                    contact_name,
-                    msg.get("type"),
-                    (msg.get("text") or {}).get("body"),
-                    msg.get("timestamp"),
-                    (metadata or {}).get("phone_number_id"),
-                    (metadata or {}).get("display_phone_number"),
-                    Json(payload),
-                ),
-            )
-            conn.commit()
+# --------------------------
+# Flask app
+# --------------------------
+app = Flask(__name__)
+
+# inicializa DB no boot
+try:
+    db_init()
+except Exception as e:
+    log.exception("[DB] Falha ao inicializar o banco: %s", e)
 
 
 @app.get("/")
-def home():
-    return "ok", 200
-
-
-@app.get("/health")
 def health():
-    # Confirma app e DB
-    try:
-        if DATABASE_URL:
-            with db_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1;")
-                    _ = cur.fetchone()
-        return "healthy", 200
-    except Exception as e:
-        return f"unhealthy: {e}", 500
+    return "ok", 200
 
 
 @app.get("/webhook")
 def webhook_verify():
-    # Meta chama isso pra verificar:
-    # /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
 
-    print(f"[VERIFY] GET mode={mode} token={token} challenge={challenge}")
+    log.info("[VERIFY] GET mode=%s token=%s challenge=%s", mode, token, challenge)
 
-    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+    if mode == "subscribe" and token == VERIFY_TOKEN:
         return Response(challenge, status=200, mimetype="text/plain")
-    return Response("forbidden", status=403, mimetype="text/plain")
+    return "forbidden", 403
 
 
 @app.post("/webhook")
-def webhook_post():
-    received_at = datetime.now(timezone.utc).isoformat()
-    raw = request.get_data(cache=False)  # raw bytes (IMPORTANTE pra assinatura)
+def webhook_receive():
+    raw = request.get_data() or b""
+    now = datetime.now(timezone.utc).isoformat()
 
-    print(f"[WEBHOOK] POST recebido {received_at}")
-    # print(f"[WEBHOOK] headers: {dict(request.headers)}")  # se quiser verboso
-    print(f"[WEBHOOK] raw_len={len(raw)}")
-
-    # 1) Segurança: validar assinatura Meta
-    signed_ok = verify_meta_signature(raw)
-    if not signed_ok:
-        # Se for só teste manual, você pode habilitar ALLOW_UNVERIFIED_TEST=true
-        if not ALLOW_UNVERIFIED_TEST:
-            print("[SEC] Assinatura inválida/ausente -> 403")
-            return Response("forbidden", status=403, mimetype="text/plain")
-
-    # 2) Parse JSON
     try:
-        payload = json.loads(raw.decode("utf-8")) if raw else None
+        payload = request.get_json(silent=True)
     except Exception:
         payload = None
 
-    if not payload or not isinstance(payload, dict):
-        print(f"[WEBHOOK] JSON inválido ou vazio. raw[:40]={raw[:40]!r}")
-        return Response("invalid json", status=400, mimetype="text/plain")
+    log.info("[WEBHOOK] POST %s len=%s", now, len(raw))
 
-    # 3) Se for ping de teste (manual)
-    if "ping" in payload:
-        store_event("ping", payload)
-        print("[PING] salvo no banco.")
+    # 1) caminho de teste (curl)
+    if payload and isinstance(payload, dict) and payload.get("ping") == "ok":
+        if not ALLOW_UNVERIFIED_TEST:
+            return "forbidden", 403
+        try:
+            db_insert("ping_test", payload, msg_type="ping", text_body="ok")
+            log.info("[PING] salvo no banco.")
+            return "ok", 200
+        except Exception as e:
+            log.exception("[PING] erro ao gravar no banco: %s", e)
+            return "db_error", 500
+
+    # 2) eventos reais da Meta (precisa validar assinatura)
+    if not verify_meta_signature(raw):
+        return "forbidden", 403
+
+    if not payload:
+        log.warning("[WEBHOOK] JSON inválido ou vazio. raw=%r", raw[:200])
+        return "invalid json", 400
+
+    # grava payload bruto (sempre)
+    try:
+        db_insert("meta_raw", payload)
+    except Exception as e:
+        log.exception("[DB] erro ao gravar payload bruto: %s", e)
+        # mesmo falhando, devolve 200 para não gerar retentativas infinitas
         return "ok", 200
 
-    # 4) Evento WhatsApp padrão
-    obj = payload.get("object", "")
-    if obj != "whatsapp_business_account":
-        store_event("unknown_object", payload)
-        print(f"[EVENT] objeto diferente: {obj} (salvo em wa_events)")
-        return "ok", 200
+    # tenta extrair mensagens
+    try:
+        entry = payload.get("entry", [])
+        for e in entry:
+            changes = e.get("changes", [])
+            for ch in changes:
+                value = ch.get("value", {})
+                contacts = value.get("contacts", [])
+                messages = value.get("messages", [])
 
-    # 5) Extrair mensagens (entry -> changes -> value -> messages)
-    entries = payload.get("entry", []) or []
-    any_saved = 0
+                name = None
+                wa_id = None
+                if contacts:
+                    prof = contacts[0].get("profile", {})
+                    name = prof.get("name")
+                    wa_id = contacts[0].get("wa_id")
 
-    for entry in entries:
-        changes = (entry or {}).get("changes", []) or []
-        for ch in changes:
-            field = (ch or {}).get("field")
-            value = (ch or {}).get("value", {}) or {}
+                for m in messages:
+                    frm = m.get("from")
+                    msg_id = m.get("id")
+                    msg_type = m.get("type")
+                    text_body = None
+                    if msg_type == "text":
+                        text_body = (m.get("text") or {}).get("body")
 
-            # Salva eventos gerais também (status, etc.)
-            if field and field != "messages":
-                store_event(field, payload)
+                    row = {
+                        "name": name,
+                        "wa_id": wa_id,
+                        "message": m,
+                        "value": value,
+                    }
 
-            if field != "messages":
-                continue
+                    db_insert(
+                        "meta_message",
+                        row,
+                        from_wa=frm,
+                        wa_id=wa_id,
+                        msg_id=msg_id,
+                        msg_type=msg_type,
+                        text_body=text_body,
+                    )
 
-            metadata = value.get("metadata", {}) or {}
-            contacts = value.get("contacts", []) or []
-            messages = value.get("messages", []) or []
+                    log.info("[MSG] from=%s name=%s type=%s text=%r", frm, name, msg_type, text_body)
 
-            contact_name = None
-            if contacts:
-                profile = (contacts[0] or {}).get("profile", {}) or {}
-                contact_name = profile.get("name")
-
-            for msg in messages:
-                store_message(msg, payload, metadata, contact_name)
-                any_saved += 1
-                print(
-                    f"[MSG] from={msg.get('from')} type={msg.get('type')} id={msg.get('id')}"
-                )
-
-    if any_saved == 0:
-        # Não veio "messages", mas veio evento válido (status por exemplo)
-        store_event("messages_empty", payload)
-        print("[EVENT] nenhum msg; payload salvo em wa_events")
+    except Exception as e:
+        log.exception("[PARSE] erro ao processar mensagem: %s", e)
 
     return "ok", 200
