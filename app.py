@@ -176,6 +176,11 @@ def verify_signature(raw_body: bytes) -> bool:
 @app.get("/")
 def home():
     return "ok", 200
+try:
+    ensure_schema()
+except Exception:
+    app.logger.exception("Falha ao garantir schema no startup")
+
 
 
 @app.get("/webhook")
