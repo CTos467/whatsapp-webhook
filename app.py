@@ -3,7 +3,7 @@ import psycopg
 import hmac
 import hashlib
 from datetime import datetime, timezone
-
+import json
 from flask import Flask, request, Response, jsonify
 import psycopg
 
@@ -310,9 +310,5 @@ def logs():
 
 
 if __name__ == "__main__":
-    # local dev
+    ensure_schema()  # cria/migra antes de subir localmente
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-    app = Flask(__name__)
-
-init_db()  # ← ISSO AQUI é o coração do sistema
-
