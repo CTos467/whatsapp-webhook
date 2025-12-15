@@ -1,30 +1,32 @@
-import psycopg
 import os
 import json
 import hmac
 import hashlib
 from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify, abort
-import psycopg
+from flask import Flask, request, Response, jsonify
+import psycopg  # psycopg v3
 
 app = Flask(__name__)
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 APP_SECRET = os.getenv("APP_SECRET", "")
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL".replace("_", ""))  # tolerância
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+ALLOW_UNVERIFIED_TEST = os.getenv("ALLOW_UNVERIFIED_TEST", "0").strip() == "1"
 
 
-def get_db():
+def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada")
-    # Render Postgres usa SSL; psycopg3 aceita sslmode=require
-    return psycopg.connect(DATABASE_URL, sslmode="require")
+        raise RuntimeError("DATABASE_URL não definido no Render.")
+    # No Render geralmente funciona bem assim:
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db():
-    with get_db() as conn:
+    """Cria tabelas e faz 'migração' leve (add colunas faltantes)."""
+    with get_conn() as conn:
         with conn.cursor() as cur:
+            # Tabela principal de mensagens
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
@@ -32,31 +34,59 @@ def init_db():
                     wa_name TEXT,
                     msg_type TEXT,
                     body TEXT,
-                    timestamp_wa BIGINT,
+                    ts BIGINT,
+                    direction TEXT DEFAULT 'in',
                     raw JSONB,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+
+            # Migrações (se a tabela já existia com colunas antigas)
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS wa_from TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS wa_name TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS msg_type TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS body TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS ts BIGINT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT 'in';")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS raw JSONB;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();")
+
+            # Eventos que não são mensagens (status, etc.)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS webhook_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    kind TEXT,
+                    raw JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+
+            # Index básico pra consulta
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(wa_from);")
+
         conn.commit()
 
 
-def verify_signature(raw_body: bytes) -> bool:
+def verify_signature(raw_body: bytes, signature_header: str) -> bool:
     """
-    Verifica X-Hub-Signature-256: sha256=<hmac>
+    Meta envia: X-Hub-Signature-256: sha256=...
     """
-    # Se você estiver testando via curl, não tem assinatura.
-    # Em produção real do WhatsApp, vai ter.
-    sig = request.headers.get("X-Hub-Signature-256", "")
-    if not sig:
+    if not APP_SECRET:
+        # Se não tem APP_SECRET configurado, não dá pra validar assinatura.
         return False
 
-    if not sig.startswith("sha256="):
+    if not signature_header or not signature_header.startswith("sha256="):
         return False
 
-    their_hash = sig.split("=", 1)[1].strip()
-    mac = hmac.new(APP_SECRET.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256)
-    our_hash = mac.hexdigest()
-    return hmac.compare_digest(our_hash, their_hash)
+    sent_sig = signature_header.split("=", 1)[1].strip()
+    calc_sig = hmac.new(APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(calc_sig, sent_sig)
+
+
+@app.before_first_request
+def startup():
+    init_db()
 
 
 @app.get("/health")
@@ -64,140 +94,138 @@ def health():
     return "ok", 200
 
 
-@app.route("/webhook", methods=["GET"])
+@app.get("/webhook")
 def webhook_verify():
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
 
-    app.logger.info(f"[VERIFY] GET mode={mode} token={token} challenge={challenge}")
+    print(f"[VERIFY] GET mode={mode} token={token} challenge={challenge}")
 
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "forbidden", 403
+        return Response(challenge, status=200)
+    return Response("forbidden", status=403)
 
 
-@app.route("/webhook", methods=["POST"])
+@app.post("/webhook")
 def webhook_receive():
-    raw = request.get_data()  # bytes
-    if not raw:
-        return "empty", 400
+    raw = request.get_data() or b""
+    sig = request.headers.get("X-Hub-Signature-256", "")
 
-    # Se for WhatsApp real, valide assinatura
-    # (Você pode permitir curl sem assinatura quando quiser testar)
-    allow_unsigned = os.getenv("ALLOW_UNSIGNED_TESTS", "false").lower() == "true"
-
-    if APP_SECRET:
-        ok_sig = verify_signature(raw)
-        if not ok_sig and not allow_unsigned:
-            app.logger.warning("[WEBHOOK] assinatura inválida/ausente -> 403")
-            return "forbidden", 403
+    # Se veio assinatura, valida. Se não veio, só permite se ALLOW_UNVERIFIED_TEST=1
+    if sig:
+        if not verify_signature(raw, sig):
+            return Response("forbidden", status=403)
+    else:
+        if not ALLOW_UNVERIFIED_TEST:
+            return Response("forbidden", status=403)
 
     # Parse JSON
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = request.get_json(force=True, silent=False)
     except Exception:
-        app.logger.exception("[WEBHOOK] JSON inválido")
-        return "invalid json", 400
+        print(f"[WEBHOOK] JSON inválido. raw={raw[:200]}")
+        return Response("invalid_json", status=400)
 
-    # Log básico
-    app.logger.info("[WEBHOOK] POST recebido")
+    print("[WEBHOOK] body:", json.dumps(payload, ensure_ascii=False)[:1000])
 
-    # Extrair mensagens no formato do WhatsApp Cloud API
-    # payload["entry"][i]["changes"][j]["value"]["messages"][k]
+    # Extrai mensagens no formato do WhatsApp Cloud API
+    extracted = []
+
+    payload_entry = payload.get("entry", [])
+    for entry in payload_entry:
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            contacts = value.get("contacts", [])
+            messages = value.get("messages", [])
+
+            # tenta pegar nome do contato (quando existir)
+            name = None
+            wa_id = None
+            if contacts:
+                prof = (contacts[0].get("profile") or {})
+                name = prof.get("name")
+                wa_id = contacts[0].get("wa_id")
+
+            for msg in messages:
+                msg_id = msg.get("id")
+                wa_from = msg.get("from") or wa_id
+                ts = msg.get("timestamp")
+                msg_type = msg.get("type")
+
+                body = None
+                if msg_type == "text":
+                    body = (msg.get("text") or {}).get("body")
+                else:
+                    # guarda algo útil pra outros tipos
+                    body = json.dumps(msg.get(msg_type, msg), ensure_ascii=False)
+
+                extracted.append({
+                    "id": msg_id or f"no_id_{datetime.now(timezone.utc).timestamp()}",
+                    "wa_from": wa_from,
+                    "wa_name": name,
+                    "msg_type": msg_type,
+                    "body": body,
+                    "ts": int(ts) if ts and str(ts).isdigit() else None,
+                    "direction": "in",
+                    "raw": payload
+                })
+
+    # Se não tem "messages" (ex: status), salva em webhook_events
     try:
-        entries = payload.get("entry", [])
-        saved = 0
-
-        with get_db() as conn:
+        with get_conn() as conn:
             with conn.cursor() as cur:
-                for entry in entries:
-                    changes = entry.get("changes", [])
-                    for ch in changes:
-                        value = ch.get("value", {})
-                        contacts = value.get("contacts", [])
-                        name = None
-                        if contacts:
-                            name = contacts[0].get("profile", {}).get("name")
-
-                        messages = value.get("messages", [])
-                        for m in messages:
-                            msg_id = m.get("id")
-                            wa_from = m.get("from")
-                            msg_type = m.get("type")
-                            ts = m.get("timestamp")
-                            ts_int = int(ts) if ts and str(ts).isdigit() else None
-
-                            body = None
-                            if msg_type == "text":
-                                body = (m.get("text") or {}).get("body")
-                            elif msg_type == "button":
-                                body = (m.get("button") or {}).get("text")
-                            elif msg_type == "interactive":
-                                # pode ser reply em lista/botão
-                                body = json.dumps(m.get("interactive"), ensure_ascii=False)
-                            else:
-                                # salva algo útil do payload inteiro do msg
-                                body = json.dumps(m, ensure_ascii=False)
-
-                            if not msg_id:
-                                # evita quebrar; gera id fallback
-                                msg_id = f"noid_{wa_from}_{datetime.now(timezone.utc).timestamp()}"
-
-                            cur.execute(
-                                """
-                                INSERT INTO messages (id, wa_from, wa_name, msg_type, body, timestamp_wa, raw)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (id) DO NOTHING;
-                                """,
-                                (msg_id, wa_from, name, msg_type, body, ts_int, json.dumps(payload))
-                            )
-                            saved += 1
-
+                if extracted:
+                    for m in extracted:
+                        cur.execute(
+                            """
+                            INSERT INTO messages (id, wa_from, wa_name, msg_type, body, ts, direction, raw)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (id) DO NOTHING;
+                            """,
+                            (m["id"], m["wa_from"], m["wa_name"], m["msg_type"], m["body"], m["ts"], m["direction"], json.dumps(m["raw"]))
+                        )
+                else:
+                    cur.execute(
+                        "INSERT INTO webhook_events (kind, raw) VALUES (%s, %s);",
+                        ("no_messages", json.dumps(payload))
+                    )
             conn.commit()
+    except Exception as e:
+        print("[DB] erro:", repr(e))
+        return Response("db_error", status=500)
 
-        return "ok", 200
-
-    except Exception:
-        app.logger.exception("[WEBHOOK] erro salvando no banco")
-        return "db_error", 500
+    return Response("ok", status=200)
 
 
 @app.get("/messages")
 def list_messages():
-    """
-    Lista as últimas 50 mensagens salvas.
-    """
+    """Só pra você conferir rápido se está gravando."""
+    limit = request.args.get("limit", "20")
     try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, wa_from, wa_name, msg_type, body, created_at
-                    FROM messages
-                    ORDER BY created_at DESC
-                    LIMIT 50;
-                """)
-                rows = cur.fetchall()
+        limit_i = max(1, min(200, int(limit)))
+    except:
+        limit_i = 20
 
-        out = []
-        for r in rows:
-            out.append({
-                "id": r[0],
-                "from": r[1],
-                "name": r[2],
-                "type": r[3],
-                "body": r[4],
-                "created_at": r[5].isoformat() if r[5] else None,
-            })
-        return jsonify(out), 200
-    except Exception:
-        app.logger.exception("[MESSAGES] erro lendo banco")
-        return jsonify({"error": "db_error"}), 500
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, wa_from, wa_name, msg_type, body, ts, created_at
+                FROM messages
+                ORDER BY created_at DESC
+                LIMIT %s;
+            """, (limit_i,))
+            rows = cur.fetchall()
 
-
-# Inicializa tabela ao subir (clássico e simples)
-try:
-    init_db()
-except Exception:
-    # não derruba o app se DB estiver momentaneamente fora
-    app.logger.exception("Falha ao inicializar DB na subida")
+    data = []
+    for r in rows:
+        data.append({
+            "id": r[0],
+            "from": r[1],
+            "name": r[2],
+            "type": r[3],
+            "body": r[4],
+            "ts": r[5],
+            "created_at": r[6].isoformat() if r[6] else None
+        })
+    return jsonify(data)
