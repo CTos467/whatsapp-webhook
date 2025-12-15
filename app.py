@@ -1,11 +1,13 @@
 import os
-import json
+import psycopg
 import hmac
 import hashlib
 from datetime import datetime, timezone
 
 from flask import Flask, request, Response, jsonify
 import psycopg
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = Flask(__name__)
 
@@ -36,6 +38,35 @@ LOGS_KEY = os.getenv("LOGS_KEY", "")  # se setar, exige ?key=...
 # =========================
 # DB helpers + migração
 # =========================
+def init_db():
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            # tabela principal
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                wa_from TEXT,
+                wa_name TEXT,
+                msg_type TEXT,
+                body TEXT,
+                timestamp_wa BIGINT,
+                raw_json JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """)
+
+            # migração defensiva (resolve seus erros atuais)
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS wa_from TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS wa_name TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS msg_type TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS body TEXT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp_wa BIGINT;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS raw_json JSONB;")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();")
+
+        conn.commit()
+
+
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada")
@@ -281,3 +312,7 @@ def logs():
 if __name__ == "__main__":
     # local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app = Flask(__name__)
+
+init_db()  # ← ISSO AQUI é o coração do sistema
+
